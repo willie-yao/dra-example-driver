@@ -44,25 +44,12 @@ import (
 )
 
 var rootDir, currentDir, demoManifestsDir string
-var observedGPUs map[string]string
-var demoFiles = []string{
-	"gpu-test1.yaml",
-	"gpu-test2.yaml",
-	"gpu-test3.yaml",
-	"gpu-test7.yaml", // deploying this earlier to ensure the pod can access in-use devices and does not block future allocations of the same devices
-	"gpu-test4.yaml",
-	"gpu-test5.yaml",
-	"gpu-test6.yaml",
-	"gpu-test8.yaml",
-}
 var clientset *kubernetes.Clientset
 var dynamicClient dynamic.Interface
 
 func init() {
 	currentDir, _ = os.Getwd()
 	rootDir = filepath.Join(filepath.Dir(currentDir), "..")
-	observedGPUs = make(map[string]string)
-	// command line flag for demo manifests directory
 	flag.StringVar(&demoManifestsDir, "demo-manifests-dir", filepath.Join(rootDir, "demo"), "Directory containing demo YAML manifests")
 }
 
@@ -102,13 +89,6 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	// issues, so retry here until we can ensure it's available before the real tests start.
 	By("Ensuring the webhook is ready")
 	verifyWebhook(ctx)
-
-	// Deploy all the test files
-	By("Deploying all the GPU test files")
-	for _, file := range demoFiles {
-		absPath := filepath.Join(demoManifestsDir, file)
-		createManifest(ctx, dynamicClient, absPath)
-	}
 })
 
 func verifyWebhook(ctx context.Context) {
@@ -149,6 +129,16 @@ func verifyWebhook(ctx context.Context) {
 	}, "30s", "1s").WithContext(ctx).Should(Succeed())
 }
 
+// deployManifest creates resources from a manifest file and returns a cleanup function.
+func deployManifest(ctx context.Context, manifestFile string) func() {
+	GinkgoHelper()
+	absPath := filepath.Join(demoManifestsDir, manifestFile)
+	createManifest(ctx, dynamicClient, absPath)
+	return func() {
+		deleteManifest(context.Background(), dynamicClient, absPath)
+	}
+}
+
 // parseManifests reads a YAML file and returns a slice of unstructured objects
 func parseManifests(manifestPath string) ([]*unstructured.Unstructured, error) {
 	data, err := os.ReadFile(manifestPath)
@@ -184,12 +174,22 @@ func parseManifests(manifestPath string) ([]*unstructured.Unstructured, error) {
 	return objects, nil
 }
 
+// kindToResource maps known Kubernetes kinds to their plural resource names.
+var kindToResource = map[string]string{
+	"Namespace":             "namespaces",
+	"Pod":                   "pods",
+	"ResourceClaim":         "resourceclaims",
+	"ResourceClaimTemplate": "resourceclaimtemplates",
+}
+
 // getGVRForObject returns the GroupVersionResource for an unstructured object
 func getGVRForObject(obj *unstructured.Unstructured) schema.GroupVersionResource {
 	gvk := obj.GroupVersionKind()
-	// Map Kind to proper resource name
-	resourceName := strings.ToLower(gvk.Kind) + "s"
-	// TODO: Add a RestMapper to get the correct resource name
+	resourceName, ok := kindToResource[gvk.Kind]
+	if !ok {
+		resourceName = strings.ToLower(gvk.Kind) + "s"
+		fmt.Fprintf(GinkgoWriter, "Warning: unknown Kind %q, using naive plural %q\n", gvk.Kind, resourceName)
+	}
 	return schema.GroupVersionResource{
 		Group:    gvk.Group,
 		Version:  gvk.Version,
@@ -288,20 +288,21 @@ func createManifestWithDryRun(ctx context.Context, dynamicClient dynamic.Interfa
 
 func checkPodsReadyAndRunning(namespace string, pods []string, expectedPodCount int) {
 	GinkgoHelper()
-	// check if the pods are Ready
 	for _, podName := range pods {
-		Eventually(func() bool {
+		Eventually(func(g Gomega) {
 			pod, err := clientset.CoreV1().Pods(namespace).Get(context.TODO(), podName, metav1.GetOptions{})
-			if err != nil {
-				return false
-			}
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to get pod %s/%s", namespace, podName)
+			ready := false
 			for _, cond := range pod.Status.Conditions {
 				if cond.Type == "Ready" && cond.Status == "True" {
-					return true
+					ready = true
+					break
 				}
 			}
-			return false
-		}, "120s", "5s").Should(BeTrue())
+			g.Expect(ready).To(BeTrue(),
+				"Pod %s/%s is not Ready (phase: %s, conditions: %v)",
+				namespace, podName, pod.Status.Phase, pod.Status.Conditions)
+		}, "120s", "5s").Should(Succeed())
 	}
 	// check if the pods are in Running state
 	podList, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
@@ -312,7 +313,8 @@ func checkPodsReadyAndRunning(namespace string, pods []string, expectedPodCount 
 			runningPodCount++
 		}
 	}
-	Expect(runningPodCount).To(Equal(expectedPodCount))
+	Expect(runningPodCount).To(Equal(expectedPodCount),
+		"Expected %d running pods in namespace %s, got %d", expectedPodCount, namespace, runningPodCount)
 }
 
 // getGPUsFromPodLogs retrieves pod logs and extracts GPU device information
@@ -342,11 +344,9 @@ func getGPUsFromPodLogs(namespace, pod, container string) ([]string, string) {
 	return gpus, logs
 }
 
-func isGPUAlreadySeen(gpu string) bool {
-	if _, alreadySeen := observedGPUs[gpu]; alreadySeen {
-		return true
-	}
-	return false
+func isGPUAlreadySeen(observedGPUs map[string]string, gpu string) bool {
+	_, alreadySeen := observedGPUs[gpu]
+	return alreadySeen
 }
 
 func extractGPUProperty(logs string, id string, property string) string {
@@ -375,8 +375,8 @@ func getGPUID(gpu string) string {
 }
 
 // verifyGPUAllocation checks that a pod/container has the expected number of GPUs
-// and tracks them in observedGPUs to ensure no GPU is claimed twice
-func verifyGPUAllocation(namespace, podName, containerName string, expectedGPUCount int) {
+// and tracks them in observedGPUs to ensure no GPU is claimed twice within a test
+func verifyGPUAllocation(namespace, podName, containerName string, expectedGPUCount int, observedGPUs map[string]string) {
 	GinkgoHelper()
 	var gpus []string
 	Eventually(func(g Gomega) {
@@ -386,7 +386,7 @@ func verifyGPUAllocation(namespace, podName, containerName string, expectedGPUCo
 
 		// Verify each GPU is unclaimed
 		for _, gpu := range gpus {
-			claimNewGPU(g, gpu, namespace, podName, containerName)
+			claimNewGPU(g, observedGPUs, gpu, namespace, podName, containerName)
 		}
 	}, checkPodLogsTimeout, checkPodLogsInterval).Should(Succeed())
 }
@@ -405,13 +405,13 @@ func verifyDRAAdminAccess(namespace, podName, containerName, expectedValue strin
 }
 
 // claimNewGPU verifies that a GPU is unclaimed and adds it to observedGPUs
-func claimNewGPU(g Gomega, gpu, namespace, podName, containerName string) {
+func claimNewGPU(g Gomega, observedGPUs map[string]string, gpu, namespace, podName, containerName string) {
 	GinkgoHelper()
-	g.Expect(isGPUAlreadySeen(gpu)).To(Equal(false),
-		fmt.Sprintf("Pod %s/%s, container %s should have a new GPU but claimed %s which is already claimed",
-			namespace, podName, containerName, gpu))
+	g.Expect(isGPUAlreadySeen(observedGPUs, gpu)).To(Equal(false),
+		fmt.Sprintf("Pod %s/%s, container %s should have a new GPU but claimed %s which is already claimed by %s",
+			namespace, podName, containerName, gpu, observedGPUs[gpu]))
 	observedGPUs[gpu] = namespace + "/" + podName
-	fmt.Fprintf(GinkgoWriter, "Pod %s/%s, container %s claimed %s", namespace, podName, containerName, gpu)
+	fmt.Fprintf(GinkgoWriter, "Pod %s/%s, container %s claimed %s\n", namespace, podName, containerName, gpu)
 }
 
 // verifyGPUCount verifies that a container has the expected number of GPUs
@@ -426,9 +426,9 @@ func verifyGPUCount(g Gomega, gpus []string, expectedGPUCount int, namespace, po
 func verifySharedGPU(g Gomega, gpu, expectedGPU, namespace, podName, containerName string) {
 	GinkgoHelper()
 	g.Expect(gpu).To(Equal(expectedGPU),
-		fmt.Sprintf("Pod %s/%s, container %s should claim the same GPU as %s, but did not",
-			namespace, podName, containerName, observedGPUs[expectedGPU]))
-	fmt.Fprintf(GinkgoWriter, "Pod %s/%s, container %s claimed %s", namespace, podName, containerName, gpu)
+		fmt.Sprintf("Pod %s/%s, container %s should claim the same GPU as previous, but got %s instead of %s",
+			namespace, podName, containerName, gpu, expectedGPU))
+	fmt.Fprintf(GinkgoWriter, "Pod %s/%s, container %s claimed %s\n", namespace, podName, containerName, gpu)
 }
 
 // verifyGPUProperties verifies GPU sharing strategy and an optional additional property
@@ -446,15 +446,3 @@ func verifyGPUProperties(g Gomega, logs, namespace, podName, containerName strin
 				namespace, podName, containerName, expectedProperty, expectedPropertyValue, propertyValue))
 	}
 }
-
-var _ = AfterSuite(func(ctx SpecContext) {
-	// Pod deletion should be fast (less than the default grace period of 30s)
-	// see https://github.com/kubernetes/kubernetes/issues/127188 for details
-	for _, file := range demoFiles {
-		absPath := filepath.Join(demoManifestsDir, file)
-		Eventually(func() error {
-			deleteManifest(ctx, dynamicClient, absPath)
-			return nil
-		}, "25s", "1s").Should(Succeed(), fmt.Sprintf("Failed to delete resources in %s within 25s", file))
-	}
-})
