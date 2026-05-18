@@ -32,6 +32,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"sigs.k8s.io/dra-example-driver/internal/profiles"
+	"sigs.k8s.io/dra-example-driver/internal/profiles/cpu"
 	"sigs.k8s.io/dra-example-driver/internal/profiles/gpu"
 	"sigs.k8s.io/dra-example-driver/pkg/flags"
 )
@@ -54,6 +55,7 @@ type Flags struct {
 	driverName                    string
 	podUID                        string
 	gpuPartitions                 int
+	cpusPerNUMANode               int
 }
 
 type Config struct {
@@ -67,6 +69,9 @@ type Config struct {
 var validProfiles = map[string]func(flags Flags) profiles.Profile{
 	gpu.ProfileName: func(flags Flags) profiles.Profile {
 		return gpu.NewProfile(flags.nodeName, flags.numDevices, flags.gpuPartitions)
+	},
+	cpu.ProfileName: func(flags Flags) profiles.Profile {
+		return cpu.NewProfile(flags.nodeName, flags.driverName, flags.numDevices, flags.cpusPerNUMANode)
 	},
 }
 
@@ -110,7 +115,7 @@ func newApp() *cli.App {
 		},
 		&cli.IntFlag{
 			Name:        "num-devices",
-			Usage:       "The number of devices to be generated. Only relevant for the " + gpu.ProfileName + " profile.",
+			Usage:       "Number of top-level devices to advertise: GPUs for the " + gpu.ProfileName + " profile, NUMA nodes for the " + cpu.ProfileName + " profile.",
 			Value:       8,
 			Destination: &flags.numDevices,
 			EnvVars:     []string{"NUM_DEVICES"},
@@ -161,6 +166,13 @@ func newApp() *cli.App {
 			Value:       0,
 			Destination: &flags.gpuPartitions,
 			EnvVars:     []string{"GPU_PARTITIONS"},
+		},
+		&cli.IntFlag{
+			Name:        "cpus-per-numa-node",
+			Usage:       "Number of CPUs each fake NUMA-node device advertises as consumable capacity. Only relevant for the " + cpu.ProfileName + " profile.",
+			Value:       4,
+			Destination: &flags.cpusPerNUMANode,
+			EnvVars:     []string{"CPUS_PER_NUMA_NODE"},
 		},
 	}
 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
